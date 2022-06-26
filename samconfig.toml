@@ -1,0 +1,17 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "jira-sync"
+s3_bucket = "YOUR_S3_BUCKET"
+s3_prefix = "jira-sync"
+region = "YOUR_REGION"
+confirm_changeset = true
+capabilities = "CAPABILITY_NAMED_IAM"
+disable_rollback = true
+image_repositories = []
+parameter_overrides = [
+  "ApiTokenSecretName=\"YOUR_SECRET_NAME\"",
+  "ApiTokenSecretArn=\"YOUR_SECRET_ARN\"",
+  "JqlQuery=\"YOUR_JQL_QUERY\"",
+  "JiraDomain=\"YOUR_DOMAIN_NAME.atlassian.net\""
+]

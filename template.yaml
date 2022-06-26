@@ -1,0 +1,217 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'JIRA Sync'
+
+Globals:
+  Function:
+    Timeout: 10
+
+Parameters:
+  ApiTokenSecretName:
+    Type: String
+  ApiTokenSecretArn:
+    Type: String
+  JqlQuery:
+    Type: String
+  JiraDomain:
+    Type: String
+
+Resources:
+  MainVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: eu-central-1a
+      CidrBlock: 10.0.2.0/23
+      MapPublicIpOnLaunch: false
+      VpcId: !GetAtt MainVpc.VpcId
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: eu-central-1a
+      CidrBlock: 10.0.0.0/24
+      MapPublicIpOnLaunch: true
+      VpcId: !GetAtt MainVpc.VpcId
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  IgwToVpcAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !GetAtt InternetGateway.InternetGatewayId
+      VpcId: !GetAtt MainVpc.VpcId
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt ElasticIp.AllocationId
+      SubnetId: !GetAtt PublicSubnet.SubnetId
+  ElasticIp:
+    DependsOn: IgwToVpcAttachment
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !GetAtt MainVpc.VpcId
+  PrivateRouteToNat:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !GetAtt PrivateRouteTable.RouteTableId
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !GetAtt NatGateway.NatGatewayId
+  RouteTableToPrivateSubnetAttachment:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !GetAtt PrivateRouteTable.RouteTableId
+      SubnetId: !GetAtt PrivateSubnet.SubnetId
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !GetAtt MainVpc.VpcId
+  PublicRouteToIgw:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !GetAtt PublicRouteTable.RouteTableId
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !GetAtt InternetGateway.InternetGatewayId
+  RouteTableToPublicSubnetAttachment:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !GetAtt PublicRouteTable.RouteTableId
+      SubnetId: !GetAtt PublicSubnet.SubnetId
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      BucketName: mdevoc-jira-sync-quicksight
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+  OutputBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref OutputBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: 
+              - 's3:PutObject'
+            Effect: Allow
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref OutputBucket
+                - /*
+            Principal: 
+              AWS: 
+                - !GetAtt LambdaRole.Arn
+              Service:
+                - lambda.amazonaws.com
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      RouteTableIds: 
+        - !GetAtt PrivateRouteTable.RouteTableId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      VpcId: !GetAtt MainVpc.VpcId
+  SyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Role: !GetAtt LambdaRole.Arn
+      CodeUri: jira_sync/
+      Handler: app.lambda_handler
+      Runtime: python3.8
+      Architectures:
+      - x86_64
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt MyApiSecurityGroup.GroupId
+        SubnetIds: 
+          - !GetAtt PrivateSubnet.SubnetId
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref OutputBucket
+          API_TOKEN_SECRET_NAME: !Ref ApiTokenSecretName
+          JQL_QUERY: !Ref JqlQuery
+          JIRA_DOMAIN: !Ref JiraDomain
+    Metadata:
+      SamResourceId: SyncFunction
+  MyApiSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !GetAtt MainVpc.VpcId
+      GroupDescription: Allows access over 443
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: !GetAtt MainVpc.CidrBlock
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: jira-sync-lambda-role
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: AccessToSecretsManager
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - 'secretsmanager:DescribeSecret'
+                  - 'secretsmanager:GetSecretValue'
+                Resource: !Ref ApiTokenSecretArn
+        - PolicyName: AccessToS3
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 's3:PutObject'
+                Resource: 'arn:aws:s3:::mdevoc-jira-sync-quicksight/*'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+  SchedulerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Schedules the jira-sync lambda function once per day
+      Name: jira-sync-scheduler
+      ScheduleExpression: "cron(0 6 * * ? *)"
+      Targets: 
+        -
+          Arn: !GetAtt SyncFunction.Arn
+          Id: "TargetFunctionV1"
+  PermissionsForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SyncFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt SchedulerRule.Arn
+
+Outputs:
+  SyncFunction:
+    Description: Lambda Function ARN
+    Value: !GetAtt SyncFunction.Arn
